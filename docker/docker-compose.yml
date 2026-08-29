@@ -10,6 +10,12 @@
 # /docker/docker-compose.yml, with `apps` for the network and
 # `context: /docker/telemetry` for the build.
 
+# Without this, compose names the project after the directory holding this
+# file -- "docker" -- which is the fleet's own project name in /docker. Sharing
+# it would make every fleet container an orphan of this project, and a
+# `down --remove-orphans` here would take the whole server with it.
+name: telemetry
+
 services:
   telemetry:
     build:
