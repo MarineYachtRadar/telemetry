@@ -1,0 +1,240 @@
+//! Validation of an incoming report.
+//!
+//! The collector is a public endpoint, so a report is trusted no further than
+//! it has been checked: it must be a JSON object, it must be small, and every
+//! field it claims must have the shape the field is stored in. Fields mayara
+//! does not send are ignored, but the body is kept verbatim so a report that
+//! grows a field before this collector knows about it is not lost.
+
+use serde::Serialize;
+use serde_json::Value;
+
+/// Largest report accepted. A real report is a few hundred bytes; anything
+/// near this limit is a mistake or an attempt to fill the disk.
+pub(crate) const MAX_BODY: usize = 20 * 1024;
+
+/// Longest accepted value of any single text field.
+const MAX_FIELD: usize = 200;
+
+/// Most feature names a build can claim, so the joined list stays bounded.
+const MAX_FEATURES: usize = 32;
+
+/// A report that passed validation, split into the columns it is stored in.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Event {
+    pub install: String,
+    pub event: String,
+    pub version: Option<String>,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub host: Option<String>,
+    pub brand: Option<String>,
+    pub model: Option<String>,
+    pub radars: Option<i64>,
+    pub dual_range: Option<bool>,
+    pub features: Option<String>,
+    pub secs_to_first_spoke: Option<i64>,
+    pub control: Option<String>,
+    /// The report exactly as received.
+    pub body: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum Invalid {
+    TooLarge,
+    NotJson,
+    NotAnObject,
+    Missing(&'static str),
+    BadField(&'static str),
+}
+
+impl std::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Invalid::TooLarge => write!(f, "report larger than {MAX_BODY} bytes"),
+            Invalid::NotJson => write!(f, "report is not valid JSON"),
+            Invalid::NotAnObject => write!(f, "report is not a JSON object"),
+            Invalid::Missing(field) => write!(f, "report has no '{field}'"),
+            Invalid::BadField(field) => write!(f, "report has an unusable '{field}'"),
+        }
+    }
+}
+
+pub(crate) fn parse(body: &[u8]) -> Result<Event, Invalid> {
+    if body.len() > MAX_BODY {
+        return Err(Invalid::TooLarge);
+    }
+    let value: Value = serde_json::from_slice(body).map_err(|_| Invalid::NotJson)?;
+    let object = value.as_object().ok_or(Invalid::NotAnObject)?;
+
+    let text = |field: &'static str| -> Result<Option<String>, Invalid> {
+        match object.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.is_empty() && s.len() <= MAX_FIELD => Ok(Some(s.clone())),
+            Some(_) => Err(Invalid::BadField(field)),
+        }
+    };
+    let required = |field: &'static str| -> Result<String, Invalid> {
+        text(field)?.ok_or(Invalid::Missing(field))
+    };
+    let number = |field: &'static str| -> Result<Option<i64>, Invalid> {
+        match object.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(Invalid::BadField(field)),
+            Some(_) => Err(Invalid::BadField(field)),
+        }
+    };
+    let flag = |field: &'static str| -> Result<Option<bool>, Invalid> {
+        match object.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(Invalid::BadField(field)),
+        }
+    };
+
+    Ok(Event {
+        install: required("install")?,
+        event: required("event")?,
+        version: text("version")?,
+        os: text("os")?,
+        arch: text("arch")?,
+        host: text("host")?,
+        brand: text("brand")?,
+        model: text("model")?,
+        radars: number("radars")?,
+        dual_range: flag("dual_range")?,
+        features: features(object.get("features"))?,
+        secs_to_first_spoke: number("secs_to_first_spoke")?,
+        control: text("control")?,
+        body: String::from_utf8_lossy(body).into_owned(),
+    })
+}
+
+/// The build features as a sorted, comma separated list, so two builds with
+/// the same brands compiled in group together however they were serialized.
+fn features(value: Option<&Value>) -> Result<Option<String>, Invalid> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Array(items) if items.len() <= MAX_FEATURES => {
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) if !s.is_empty() && s.len() <= MAX_FIELD => names.push(s.to_string()),
+                    _ => return Err(Invalid::BadField("features")),
+                }
+            }
+            names.sort_unstable();
+            Ok(Some(names.join(",")))
+        }
+        _ => Err(Invalid::BadField("features")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report as mayara's telemetry module sends it.
+    fn report() -> String {
+        serde_json::json!({
+            "install": "11111111-2222-3333-4444-555555555555",
+            "version": "3.10.0",
+            "os": "linux",
+            "arch": "aarch64",
+            "host": "standalone",
+            "event": "spokes",
+            "brand": "Navico",
+            "model": "HALO",
+            "radars": 2,
+            "dual_range": true,
+            "features": ["navico", "furuno", "garmin", "koden", "raymarine"],
+            "secs_to_first_spoke": 12
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_mayara_report_keeps_every_field_it_sent() {
+        let event = parse(report().as_bytes()).unwrap();
+
+        assert_eq!(event.install, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(event.event, "spokes");
+        assert_eq!(event.version.as_deref(), Some("3.10.0"));
+        assert_eq!(event.brand.as_deref(), Some("Navico"));
+        assert_eq!(event.model.as_deref(), Some("HALO"));
+        assert_eq!(event.radars, Some(2));
+        assert_eq!(event.dual_range, Some(true));
+        assert_eq!(event.secs_to_first_spoke, Some(12));
+        assert_eq!(event.control, None);
+        assert_eq!(event.body, report());
+    }
+
+    #[test]
+    fn features_are_sorted_so_equal_builds_group_together() {
+        let one = parse(br#"{"install":"i","event":"e","features":["navico","furuno"]}"#).unwrap();
+        let other =
+            parse(br#"{"install":"i","event":"e","features":["furuno","navico"]}"#).unwrap();
+
+        assert_eq!(one.features.as_deref(), Some("furuno,navico"));
+        assert_eq!(one.features, other.features);
+    }
+
+    #[test]
+    fn a_report_without_install_or_event_is_refused() {
+        assert_eq!(
+            parse(br#"{"event":"spokes"}"#),
+            Err(Invalid::Missing("install"))
+        );
+        assert_eq!(parse(br#"{"install":"i"}"#), Err(Invalid::Missing("event")));
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_json_object_is_refused() {
+        assert_eq!(parse(b"not json"), Err(Invalid::NotJson));
+        assert_eq!(parse(b"[1,2,3]"), Err(Invalid::NotAnObject));
+        assert_eq!(parse(b"\"install\""), Err(Invalid::NotAnObject));
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_is_refused() {
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","radars":"many"}"#),
+            Err(Invalid::BadField("radars"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","dual_range":"yes"}"#),
+            Err(Invalid::BadField("dual_range"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","version":7}"#),
+            Err(Invalid::BadField("version"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","features":[1]}"#),
+            Err(Invalid::BadField("features"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_field_or_body_is_refused() {
+        let long = "x".repeat(MAX_FIELD + 1);
+        let body = format!(r#"{{"install":"i","event":"e","model":"{long}"}}"#);
+        assert_eq!(parse(body.as_bytes()), Err(Invalid::BadField("model")));
+
+        let padding = "x".repeat(MAX_BODY);
+        let body = format!(r#"{{"install":"i","event":"e","model":"{padding}"}}"#);
+        assert_eq!(parse(body.as_bytes()), Err(Invalid::TooLarge));
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_but_kept_in_the_stored_body() {
+        let body = br#"{"install":"i","event":"e","something_new":{"deep":[1]}}"#;
+        let event = parse(body).unwrap();
+
+        assert_eq!(event.install, "i");
+        assert_eq!(event.body, String::from_utf8_lossy(body));
+    }
+}

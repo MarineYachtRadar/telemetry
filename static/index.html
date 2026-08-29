@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mayara telemetry</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --ink: #16202b;
+  --muted: #5d6b7a;
+  --line: #dfe4ea;
+  --bar: #2f7fd1;
+  --bar-soft: #cfe1f4;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12171d;
+    --card: #1a2129;
+    --ink: #e6ecf2;
+    --muted: #94a3b3;
+    --line: #2a343f;
+    --bar: #4d9de0;
+    --bar-soft: #24374a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
+header { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; justify-content: space-between; }
+h1 { font-size: 22px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+p.lede { color: var(--muted); margin: 6px 0 24px; max-width: 62ch; }
+select {
+  font: inherit; color: inherit; background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 28px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.card .value { font-size: 27px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.card .label { color: var(--muted); font-size: 13px; margin-top: 2px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.grid section { margin: 0; }
+table { width: 100%; border-collapse: collapse; }
+td { padding: 5px 0; vertical-align: middle; }
+td.key { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; padding-right: 12px; }
+td.bar { width: 100%; }
+td.count { text-align: right; padding-left: 12px; font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+.track { background: var(--bar-soft); border-radius: 3px; height: 8px; }
+.fill { background: var(--bar); border-radius: 3px; height: 8px; }
+.empty { color: var(--muted); font-style: italic; font-size: 13px; margin: 8px 0 0; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg rect { fill: var(--bar); }
+svg text { fill: var(--muted); font-size: 11px; }
+footer { color: var(--muted); font-size: 13px; margin-top: 28px; }
+code { background: var(--bar-soft); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+a { color: var(--bar); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>mayara telemetry</h1>
+    <label>Window
+      <select id="days">
+        <option value="30">30 days</option>
+        <option value="90" selected>90 days</option>
+        <option value="365">1 year</option>
+        <option value="3650">all time</option>
+      </select>
+    </label>
+  </header>
+
+  <p class="lede">
+    What mayara installs report about themselves: a random install id, a version, a platform and
+    the radar they drive. No position, serial number, network address or vessel data is collected.
+  </p>
+
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>Reports per day</h2>
+    <div id="daily"></div>
+  </section>
+
+  <div class="grid" id="breakdowns"></div>
+
+  <footer>
+    Open data: <code>GET /v1/stats?days=90</code> and <code>GET /v1/events?limit=100</code>.
+    Installs report through <code>POST /v1/event</code>; turn that off with
+    <code>--no-telemetry</code>.
+    <span id="generated"></span>
+  </footer>
+</main>
+
+<script>
+const BREAKDOWNS = [
+  ['brands', 'Radar brand'],
+  ['models', 'Radar model'],
+  ['versions', 'Mayara version'],
+  ['os', 'Operating system'],
+  ['arch', 'Architecture'],
+  ['hosts', 'Launched as'],
+  ['events', 'Report type'],
+  ['controls', 'First control used'],
+  ['features', 'Brands built in'],
+];
+
+const el = (tag, props = {}, children = []) => {
+  const node = Object.assign(document.createElement(tag), props);
+  for (const child of children) node.append(child);
+  return node;
+};
+
+function cards(totals) {
+  const target = document.getElementById('cards');
+  target.replaceChildren(...[
+    [totals.installs_in_window, 'installs in window'],
+    [totals.events_in_window, 'reports in window'],
+    [totals.installs, 'installs all time'],
+    [totals.events, 'reports all time'],
+  ].map(([value, label]) => el('div', { className: 'card' }, [
+    el('div', { className: 'value', textContent: value.toLocaleString() }),
+    el('div', { className: 'label', textContent: label }),
+  ])));
+}
+
+function table(rows) {
+  if (!rows.length) return el('p', { className: 'empty', textContent: 'Nothing reported yet.' });
+  const top = Math.max(...rows.map((row) => row.installs)) || 1;
+  return el('table', {}, rows.slice(0, 12).map((row) => el('tr', {}, [
+    el('td', { className: 'key', title: row.key, textContent: row.key }),
+    el('td', { className: 'bar' }, [
+      el('div', { className: 'track' }, [
+        el('div', { className: 'fill', style: `width: ${Math.round((row.installs / top) * 100)}%` }),
+      ]),
+    ]),
+    el('td', { className: 'count', textContent: `${row.installs} / ${row.events}` }),
+  ])));
+}
+
+function breakdowns(stats) {
+  document.getElementById('breakdowns').replaceChildren(...BREAKDOWNS.map(([key, title]) =>
+    el('section', {}, [
+      el('h2', { textContent: `${title} — installs / reports` }),
+      table(stats[key] || []),
+    ])));
+}
+
+function daily(days) {
+  const target = document.getElementById('daily');
+  if (!days.length) {
+    target.replaceChildren(el('p', { className: 'empty', textContent: 'Nothing reported yet.' }));
+    return;
+  }
+  const width = 1000, height = 110, gap = 2;
+  const top = Math.max(...days.map((day) => day.events));
+  const slot = width / days.length;
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height + 18}`);
+  days.forEach((day, i) => {
+    const bar = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    const tall = Math.max(1, Math.round((day.events / top) * height));
+    bar.setAttribute('x', (i * slot).toFixed(2));
+    bar.setAttribute('y', height - tall);
+    bar.setAttribute('width', Math.max(1, slot - gap).toFixed(2));
+    bar.setAttribute('height', tall);
+    const hint = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+    hint.textContent = `${day.day}: ${day.events} reports, ${day.installs} installs`;
+    bar.append(hint);
+    svg.append(bar);
+  });
+  for (const [i, anchor] of [[0, 'start'], [days.length - 1, 'end']]) {
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    label.setAttribute('x', i === 0 ? 0 : width);
+    label.setAttribute('y', height + 14);
+    label.setAttribute('text-anchor', anchor);
+    label.textContent = days[i].day;
+    svg.append(label);
+  }
+  target.replaceChildren(svg, el('p', { className: 'empty', textContent: `peak ${top} reports in a day` }));
+}
+
+async function load() {
+  const days = document.getElementById('days').value;
+  const response = await fetch(`v1/stats?days=${days}`);
+  const stats = await response.json();
+  cards(stats.totals);
+  daily(stats.daily);
+  breakdowns(stats);
+  document.getElementById('generated').textContent =
+    stats.totals.last_event ? `Last report ${stats.totals.last_event} UTC.` : '';
+}
+
+document.getElementById('days').addEventListener('change', load);
+load().catch((e) => {
+  document.getElementById('cards').replaceChildren(
+    el('p', { className: 'empty', textContent: `Cannot load statistics: ${e}` }));
+});
+</script>
+</body>
+</html>
