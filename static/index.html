@@ -94,9 +94,10 @@ a { color: var(--bar); }
   <div class="grid" id="breakdowns"></div>
 
   <footer>
-    Open data: <code>GET /v1/stats?days=90</code> and <code>GET /v1/events?limit=100</code>.
-    Installs report through <code>POST /v1/event</code>; turn that off with
-    <code>--no-telemetry</code>.
+    Open data: <code class="path" data-verb="GET" data-path="v1/stats?days=90"></code> and
+    <code class="path" data-verb="GET" data-path="v1/events?limit=100"></code>.
+    Installs report through <code class="path" data-verb="POST" data-path="v1/event"></code>;
+    turn that off with <code>--no-telemetry</code>.
     <span id="generated"></span>
   </footer>
 </main>
@@ -163,7 +164,10 @@ function daily(days) {
   }
   const width = 1000, height = 110, gap = 2;
   const top = Math.max(...days.map((day) => day.events));
-  const slot = width / days.length;
+  // A young collector has a handful of days; keep the bars the width they
+  // would have in a full window rather than stretching one across the page.
+  const slot = width / Math.max(days.length, 14);
+  const span = days.length * slot;
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', `0 0 ${width} ${height + 18}`);
   days.forEach((day, i) => {
@@ -178,9 +182,11 @@ function daily(days) {
     bar.append(hint);
     svg.append(bar);
   });
-  for (const [i, anchor] of [[0, 'start'], [days.length - 1, 'end']]) {
+  // With one day the two labels would sit on top of each other.
+  const ends = days.length > 1 ? [[0, 0, 'start'], [days.length - 1, span, 'end']] : [[0, 0, 'start']];
+  for (const [i, x, anchor] of ends) {
     const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    label.setAttribute('x', i === 0 ? 0 : width);
+    label.setAttribute('x', x);
     label.setAttribute('y', height + 14);
     label.setAttribute('text-anchor', anchor);
     label.textContent = days[i].day;
@@ -198,6 +204,14 @@ async function load() {
   breakdowns(stats);
   document.getElementById('generated').textContent =
     stats.totals.last_event ? `Last report ${stats.totals.last_event} UTC.` : '';
+}
+
+// The page is mounted under a prefix (/mayara/) and every request it makes is
+// relative to that, so the paths it quotes are derived the same way rather
+// than hardcoded.
+const base = new URL('.', location.href).pathname;
+for (const node of document.querySelectorAll('code.path')) {
+  node.textContent = `${node.dataset.verb} ${base}${node.dataset.path}`;
 }
 
 document.getElementById('days').addEventListener('change', load);

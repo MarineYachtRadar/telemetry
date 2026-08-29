@@ -26,20 +26,25 @@ Mayara sends at most two reports per run, and reporting is off with `--no-teleme
 
 The collected data is anonymous and public: every `GET` answers with `Access-Control-Allow-Origin: *`.
 
+Everything is served under a `/mayara/` prefix so the host can carry other projects later;
+`https://telemetry.keversoft.com/` redirects there. The collector itself serves at its own root and
+builds every URL in its page relative to the current one, so it neither knows nor cares which prefix
+it is mounted under — nginx strips it.
+
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /v1/event` | Receive one report. `204` on success. |
-| `GET /v1/stats?days=90` | Aggregate view. `days` is clamped to 1…3650, and defaults to 90. |
-| `GET /v1/events?limit=100` | The most recent reports, newest first. `limit` is clamped to 1…1000. |
-| `GET /health` | `{"status":"ok","last_event":…}`, or `503` if the database is unreachable. |
-| `GET /` | The page that reads `/v1/stats`. |
+| `POST /mayara/v1/event` | Receive one report. `204` on success. |
+| `GET /mayara/v1/stats?days=90` | Aggregate view. `days` is clamped to 1…3650, and defaults to 90. |
+| `GET /mayara/v1/events?limit=100` | The most recent reports, newest first. `limit` is clamped to 1…1000. |
+| `GET /mayara/health` | `{"status":"ok","last_event":…}`, or `503` if the database is unreachable. |
+| `GET /mayara/` | The page that reads `v1/stats`. |
 
 A report must be a JSON object of at most 20 KB carrying at least `install` and `event`; every
 other field is optional but must have the type it is stored in. Fields this collector does not know
 about are ignored, but the body is stored verbatim, so a report from a newer mayara loses nothing.
 
 ```console
-$ curl -X POST https://telemetry.keversoft.com/v1/event \
+$ curl -X POST https://telemetry.keversoft.com/mayara/v1/event \
     -H 'content-type: application/json' \
     -d '{"install":"…","event":"spokes","version":"3.10.0","os":"linux","brand":"Navico"}'
 ```
@@ -68,7 +73,7 @@ $ cargo run -- --listen 127.0.0.1:8099 --database telemetry.db
 
 The collector runs as a container on keversoft.com's existing `docker_apps` network, alongside the
 `webserver` (nginx) container that terminates TLS. Nothing is published on the host: nginx reaches
-the collector by container name at `http://telemetry:8099`.
+the collector by container name at `http://telemetry:8099` and mounts it under `/mayara/`.
 
 ```console
 # git clone … /docker/telemetry && cd /docker/telemetry
@@ -91,7 +96,9 @@ Then the certificate and the site:
 
 Issue the certificate first: nginx refuses to start if a site names one that is not there yet.
 
-Two details in the site config are load-bearing. `proxy_pass` goes through a variable so the
+Three details in the site config are load-bearing. The `/mayara/` prefix is stripped with a
+`rewrite … break` rather than a URI on `proxy_pass`, because nginx does not apply that form when the
+upstream is named through a variable. `proxy_pass` goes through a variable so the
 container name is looked up per request against Docker's embedded DNS — a literal name is resolved
 once at startup, and nginx would keep proxying to a stale address after the collector container is
 recreated. And `X-Forwarded-For` carries the peer nginx saw as its last entry, which is the entry
@@ -103,8 +110,8 @@ service block there with `apps` as its network and `context: /docker/telemetry` 
 Watchtower does not need to know about it: the image is built here, not pulled.
 
 Mayara only reports once it has a collector to report to: `DEFAULT_ENDPOINT` in
-`src/lib/telemetry.rs` has to be set to `https://telemetry.keversoft.com/v1/event` before any
-release starts sending.
+`src/lib/telemetry.rs` has to be set to `https://telemetry.keversoft.com/mayara/v1/event` before
+any release starts sending.
 
 ## Layout
 
