@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.claude/
+deploy/
+*.md
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.gitignore
+docker/
+Makefile
