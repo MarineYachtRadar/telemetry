@@ -81,7 +81,8 @@ a { color: var(--bar); }
 
   <p class="lede">
     What mayara installs report about themselves: a random install id, a version, a platform and
-    the radar they drive. No position, serial number, network address or vessel data is collected.
+    the radar they drive, down to the hours it has transmitted where the radar counts them.
+    No position, serial number, network address or vessel data is collected.
   </p>
 
   <div class="cards" id="cards"></div>
@@ -106,13 +107,14 @@ a { color: var(--bar); }
 const BREAKDOWNS = [
   ['brands', 'Radar brand'],
   ['models', 'Radar model'],
+  ['transmit_hours', 'Radar transmit time'],
   ['versions', 'Mayara version'],
+  ['builds', 'Build origin'],
   ['os', 'Operating system'],
   ['arch', 'Architecture'],
-  ['hosts', 'Launched as'],
+  ['deployments', 'Launched as'],
   ['events', 'Report type'],
   ['controls', 'First control used'],
-  ['features', 'Brands built in'],
 ];
 
 const el = (tag, props = {}, children = []) => {

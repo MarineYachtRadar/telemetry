@@ -21,26 +21,38 @@ const MAX_PER_INSTALL_PER_DAY: i64 = 50;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS event (
-    id                  INTEGER PRIMARY KEY,
-    received_at         INTEGER NOT NULL,
-    install             TEXT    NOT NULL,
-    event               TEXT    NOT NULL,
-    version             TEXT,
-    os                  TEXT,
-    arch                TEXT,
-    host                TEXT,
-    brand               TEXT,
-    model               TEXT,
-    radars              INTEGER,
-    dual_range          INTEGER,
-    features            TEXT,
-    secs_to_first_spoke INTEGER,
-    control             TEXT,
-    body                TEXT    NOT NULL
+    id          INTEGER PRIMARY KEY,
+    received_at INTEGER NOT NULL,
+    install     TEXT    NOT NULL,
+    event       TEXT    NOT NULL,
+    body        TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_received_at ON event (received_at);
 CREATE INDEX IF NOT EXISTS event_install ON event (install, received_at);
 ";
+
+/// Columns every report has, whatever mayara sends.
+const FIXED_COLUMNS: [&str; 5] = ["id", "received_at", "install", "event", "body"];
+
+/// The optional fields of a report, each in a column named after the field it
+/// holds. This is the one place a field is named: a column listed here is
+/// created on the next start and filled from the bodies already stored, and a
+/// column no longer listed is dropped. Every report is kept verbatim in
+/// `body`, so nothing is lost either way.
+const REPORT_COLUMNS: [(&str, &str); 12] = [
+    ("version", "TEXT"),
+    ("os", "TEXT"),
+    ("arch", "TEXT"),
+    ("deployment", "TEXT"),
+    ("brand", "TEXT"),
+    ("model", "TEXT"),
+    ("build", "TEXT"),
+    ("control", "TEXT"),
+    ("radars", "INTEGER"),
+    ("dual_range", "INTEGER"),
+    ("transmit_hours", "INTEGER"),
+    ("secs_to_first_spoke", "INTEGER"),
+];
 
 #[derive(Clone)]
 pub(crate) struct Db {
@@ -74,6 +86,7 @@ impl Db {
         connection
             .execute_batch(SCHEMA)
             .context("cannot create database schema")?;
+        migrate(&connection).context("cannot bring the database up to date")?;
         Ok(Db {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -103,6 +116,39 @@ impl Db {
     }
 }
 
+/// Reconcile the table with the fields this collector knows about. A column
+/// carries the report field of the same name, so one that has just been added
+/// can be filled from the bodies already stored, and one that has gone out of
+/// use can be dropped: the report itself is never touched.
+fn migrate(connection: &Connection) -> rusqlite::Result<()> {
+    let present: Vec<String> = {
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info('event')")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    // Every name below is either one of this module's own literals or a
+    // column name read back from the table this module created.
+    for (column, kind) in REPORT_COLUMNS {
+        if present.iter().any(|name| name == column) {
+            continue;
+        }
+        connection.execute_batch(&format!(
+            "ALTER TABLE event ADD COLUMN {column} {kind};
+             UPDATE event SET {column} = json_extract(body, '$.{column}');"
+        ))?;
+    }
+
+    let wanted = |name: &String| {
+        FIXED_COLUMNS.contains(&name.as_str())
+            || REPORT_COLUMNS.iter().any(|(column, _)| column == name)
+    };
+    for column in present.iter().filter(|name| !wanted(name)) {
+        connection.execute_batch(&format!("ALTER TABLE event DROP COLUMN {column};"))?;
+    }
+    Ok(())
+}
+
 /// Store a report, unless this install has already filled its day. Returns
 /// whether the report was stored.
 pub(crate) fn insert(connection: &Connection, now: i64, event: &Event) -> rusqlite::Result<bool> {
@@ -118,9 +164,9 @@ pub(crate) fn insert(connection: &Connection, now: i64, event: &Event) -> rusqli
 
     connection.execute(
         "INSERT INTO event (
-             received_at, install, event, version, os, arch, host, brand, model,
-             radars, dual_range, features, secs_to_first_spoke, control, body
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             received_at, install, event, version, os, arch, deployment, brand, model,
+             build, control, radars, dual_range, transmit_hours, secs_to_first_spoke, body
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             now,
             event.install,
@@ -128,14 +174,15 @@ pub(crate) fn insert(connection: &Connection, now: i64, event: &Event) -> rusqli
             event.version,
             event.os,
             event.arch,
-            event.host,
+            event.deployment,
             event.brand,
             event.model,
+            event.build,
+            event.control,
             event.radars,
             event.dual_range,
-            event.features,
+            event.transmit_hours,
             event.secs_to_first_spoke,
-            event.control,
             event.body,
         ],
     )?;
@@ -185,6 +232,8 @@ mod tests {
                 "version": "3.10.0",
                 "os": "linux",
                 "brand": "Navico",
+                "build": "official",
+                "transmit_hours": 1234,
             })
             .to_string()
             .as_bytes(),
@@ -237,6 +286,81 @@ mod tests {
             assert!(insert(connection, now, &event("quiet", "spokes")).unwrap());
             assert!(insert(connection, now + 24 * 60 * 60 + 1, &event("loud", "spokes")).unwrap());
         });
+    }
+
+    fn columns(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('event')")
+            .unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A database written by an older collector keeps its reports: the
+    /// columns it never had are filled from the bodies it stored, and the
+    /// columns nothing reads any more go away.
+    #[test]
+    fn an_older_database_is_brought_forward_from_the_bodies_it_stored() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event (
+                     id          INTEGER PRIMARY KEY,
+                     received_at INTEGER NOT NULL,
+                     install     TEXT    NOT NULL,
+                     event       TEXT    NOT NULL,
+                     version     TEXT,
+                     host        TEXT,
+                     features    TEXT,
+                     body        TEXT    NOT NULL
+                 );",
+            )
+            .unwrap();
+        let body = serde_json::json!({
+            "install": "a",
+            "event": "spokes",
+            "version": "3.12.3",
+            "deployment": "container",
+            "build": "official",
+            "transmit_hours": 1234,
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO event (received_at, install, event, version, features, body)
+                 VALUES (1, 'a', 'spokes', '3.12.3', 'furuno,navico', ?1)",
+                params![body],
+            )
+            .unwrap();
+
+        let db = Db::prepare(connection).unwrap();
+
+        db.with(|connection| {
+            let names = columns(connection);
+            assert!(!names.iter().any(|n| n == "host" || n == "features"));
+
+            let (deployment, build, hours): (String, String, i64) = connection
+                .query_row(
+                    "SELECT deployment, build, transmit_hours FROM event",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(deployment, "container");
+            assert_eq!(build, "official");
+            assert_eq!(hours, 1234);
+        });
+    }
+
+    /// Opening the same database twice must not try to add the columns again.
+    #[test]
+    fn bringing_a_database_forward_twice_changes_nothing() {
+        let db = Db::in_memory().unwrap();
+        let before = db.with(columns);
+
+        db.with(|connection| migrate(connection).unwrap());
+
+        assert_eq!(db.with(columns), before);
     }
 
     #[test]

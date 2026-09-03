@@ -17,6 +17,12 @@ pub(crate) const MAX_DAYS: i64 = 3650;
 /// answer.
 const MAX_BUCKETS: i64 = 100;
 
+/// Where the transmit time buckets divide, in hours. A lifetime counter runs
+/// from a radar switched on once to a magnetron near the end of its life, so
+/// the buckets widen as they go; the last one is everything above the last
+/// bound.
+const TRANSMIT_BOUNDS: [i64; 6] = [10, 50, 100, 500, 1000, 5000];
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Stats {
     pub generated_at: String,
@@ -25,12 +31,13 @@ pub(crate) struct Stats {
     pub versions: Vec<Bucket>,
     pub brands: Vec<Bucket>,
     pub models: Vec<Bucket>,
+    pub builds: Vec<Bucket>,
     pub os: Vec<Bucket>,
     pub arch: Vec<Bucket>,
-    pub hosts: Vec<Bucket>,
+    pub deployments: Vec<Bucket>,
     pub events: Vec<Bucket>,
     pub controls: Vec<Bucket>,
-    pub features: Vec<Bucket>,
+    pub transmit_hours: Vec<Bucket>,
     pub daily: Vec<Day>,
 }
 
@@ -73,12 +80,13 @@ pub(crate) fn collect(connection: &Connection, now: i64, days: i64) -> rusqlite:
         versions: breakdown(connection, "version", since)?,
         brands: breakdown(connection, "brand", since)?,
         models: breakdown(connection, "model", since)?,
+        builds: breakdown(connection, "build", since)?,
         os: breakdown(connection, "os", since)?,
         arch: breakdown(connection, "arch", since)?,
-        hosts: breakdown(connection, "host", since)?,
+        deployments: breakdown(connection, "deployment", since)?,
         events: breakdown(connection, "event", since)?,
         controls: breakdown(connection, "control", since)?,
-        features: breakdown(connection, "features", since)?,
+        transmit_hours: transmit_hours(connection, since)?,
         daily: daily(connection, since)?,
     })
 }
@@ -130,6 +138,40 @@ fn breakdown(connection: &Connection, column: &str, since: i64) -> rusqlite::Res
     rows.collect()
 }
 
+/// Installs and reports by how long their radar has transmitted. Exact hour
+/// counts are as good as unique, so they are grouped into bands and left in
+/// the order the bands run rather than sorted by size.
+fn transmit_hours(connection: &Connection, since: i64) -> rusqlite::Result<Vec<Bucket>> {
+    let mut band = String::from("CASE");
+    for (index, bound) in TRANSMIT_BOUNDS.iter().enumerate() {
+        band.push_str(&format!(" WHEN transmit_hours < {bound} THEN {index}"));
+    }
+    band.push_str(&format!(" ELSE {} END", TRANSMIT_BOUNDS.len()));
+
+    let sql = format!(
+        "SELECT {band}, COUNT(DISTINCT install), COUNT(*)
+         FROM event WHERE received_at >= ?1 AND transmit_hours IS NOT NULL
+         GROUP BY 1 ORDER BY 1"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params![since], |row| {
+        Ok(Bucket {
+            key: transmit_band(row.get::<_, i64>(0)? as usize),
+            installs: row.get(1)?,
+            events: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn transmit_band(index: usize) -> String {
+    let from = index.checked_sub(1).map_or(0, |i| TRANSMIT_BOUNDS[i]);
+    match TRANSMIT_BOUNDS.get(index) {
+        Some(to) => format!("{from}\u{2013}{to} h"),
+        None => format!("{from}+ h"),
+    }
+}
+
 fn daily(connection: &Connection, since: i64) -> rusqlite::Result<Vec<Day>> {
     let mut statement = connection.prepare(
         "SELECT date(received_at, 'unixepoch'), COUNT(DISTINCT install), COUNT(*)
@@ -156,6 +198,15 @@ mod tests {
     const DAY: i64 = 24 * 60 * 60;
 
     fn report(install: &str, brand: &str, control: Option<&str>) -> event::Event {
+        with_hours(install, brand, control, None)
+    }
+
+    fn with_hours(
+        install: &str,
+        brand: &str,
+        control: Option<&str>,
+        transmit_hours: Option<i64>,
+    ) -> event::Event {
         event::parse(
             serde_json::json!({
                 "install": install,
@@ -163,7 +214,9 @@ mod tests {
                 "version": "3.10.0",
                 "os": "linux",
                 "brand": brand,
+                "build": "official",
                 "control": control,
+                "transmit_hours": transmit_hours,
             })
             .to_string()
             .as_bytes(),
@@ -234,6 +287,36 @@ mod tests {
                 installs: 1,
                 events: 1,
             }]
+        );
+    }
+
+    /// Radars are grouped by how long they have transmitted, in the order
+    /// the bands run, and a report with no reading is left out of them.
+    #[test]
+    fn transmit_time_is_grouped_into_bands_in_ascending_order() {
+        let db = Db::in_memory().unwrap();
+        db.with(|connection| {
+            insert(connection, NOW, &with_hours("a", "Navico", None, Some(9))).unwrap();
+            insert(connection, NOW, &with_hours("b", "Navico", None, Some(60))).unwrap();
+            insert(connection, NOW, &with_hours("c", "Navico", None, Some(70))).unwrap();
+            insert(
+                connection,
+                NOW,
+                &with_hours("d", "Navico", None, Some(9999)),
+            )
+            .unwrap();
+            insert(connection, NOW, &report("e", "Navico", None)).unwrap();
+        });
+
+        let stats = stats(&db, 90);
+        let bands: Vec<(&str, i64)> = stats
+            .transmit_hours
+            .iter()
+            .map(|b| (b.key.as_str(), b.installs))
+            .collect();
+        assert_eq!(
+            bands,
+            vec![("0\u{2013}10 h", 1), ("50\u{2013}100 h", 2), ("5000+ h", 1)]
         );
     }
 
