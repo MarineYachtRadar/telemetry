@@ -10,10 +10,11 @@ which terminates TLS; the collector itself listens on loopback only.
 ## What is collected
 
 Exactly what mayara sends, and nothing else. Per report: a random install id created on first run,
-the mayara version, the operating system and architecture, how mayara was launched, the radar brand
-and model, how many radars were seen, whether the radar is dual range, which brands the build has
-compiled in, and either the seconds until the first spoke arrived or the name of the first control
-the user changed.
+the mayara version, whether the build came from mayara's own CI or was compiled elsewhere, the
+operating system and architecture, how mayara was launched, the radar brand and model, how many
+radars were seen, whether the radar is dual range, how many hours the radar has transmitted over
+its life where it counts that, and either the seconds until the first spoke arrived or the name of
+the first control the user changed.
 
 There is no position, serial number, network address or vessel data in a report, and none is added
 here: **the address a report arrives from is never written to disk**. It is held in memory only, for
@@ -42,6 +43,9 @@ it is mounted under — nginx strips it.
 A report must be a JSON object of at most 20 KB carrying at least `install` and `event`; every
 other field is optional but must have the type it is stored in. Fields this collector does not know
 about are ignored, but the body is stored verbatim, so a report from a newer mayara loses nothing.
+That is also how the database is brought forward: the columns a report is split into are named
+after its fields, so teaching the collector a field adds the column on the next start and fills it
+from the bodies already stored, and a field that falls out of use drops its column.
 
 ```console
 $ curl -X POST https://telemetry.keversoft.com/mayara/v1/event \
@@ -118,7 +122,7 @@ any release starts sending.
 | File | Contents |
 | --- | --- |
 | `src/event.rs` | What a report must look like to be accepted |
-| `src/db.rs` | Schema, storage, and the per-install cap |
+| `src/db.rs` | Schema, storage, the per-install cap, and bringing an older database forward |
 | `src/stats.rs` | The aggregate queries behind `/v1/stats` |
 | `src/ratelimit.rs` | The per-address budget, in memory only |
 | `src/web.rs` | Routes and handlers |

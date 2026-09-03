@@ -16,9 +16,6 @@ pub(crate) const MAX_BODY: usize = 20 * 1024;
 /// Longest accepted value of any single text field.
 const MAX_FIELD: usize = 200;
 
-/// Most feature names a build can claim, so the joined list stays bounded.
-const MAX_FEATURES: usize = 32;
-
 /// A report that passed validation, split into the columns it is stored in.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Event {
@@ -27,12 +24,13 @@ pub(crate) struct Event {
     pub version: Option<String>,
     pub os: Option<String>,
     pub arch: Option<String>,
-    pub host: Option<String>,
+    pub deployment: Option<String>,
     pub brand: Option<String>,
     pub model: Option<String>,
+    pub build: Option<String>,
     pub radars: Option<i64>,
     pub dual_range: Option<bool>,
-    pub features: Option<String>,
+    pub transmit_hours: Option<i64>,
     pub secs_to_first_spoke: Option<i64>,
     pub control: Option<String>,
     /// The report exactly as received.
@@ -77,10 +75,18 @@ pub(crate) fn parse(body: &[u8]) -> Result<Event, Invalid> {
     let required = |field: &'static str| -> Result<String, Invalid> {
         text(field)?.ok_or(Invalid::Missing(field))
     };
-    let number = |field: &'static str| -> Result<Option<i64>, Invalid> {
+    // Every number a report carries counts something -- radars, hours,
+    // seconds -- so none of them can be negative. A negative one is a report
+    // that went wrong somewhere, not a radar that transmitted backwards, and
+    // it would otherwise settle into the lowest bucket of a breakdown as if
+    // it meant something.
+    let count = |field: &'static str| -> Result<Option<i64>, Invalid> {
         match object.get(field) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(Invalid::BadField(field)),
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(n) if n >= 0 => Ok(Some(n)),
+                _ => Err(Invalid::BadField(field)),
+            },
             Some(_) => Err(Invalid::BadField(field)),
         }
     };
@@ -98,39 +104,17 @@ pub(crate) fn parse(body: &[u8]) -> Result<Event, Invalid> {
         version: text("version")?,
         os: text("os")?,
         arch: text("arch")?,
-        host: text("host")?,
+        deployment: text("deployment")?,
         brand: text("brand")?,
         model: text("model")?,
-        radars: number("radars")?,
+        build: text("build")?,
+        radars: count("radars")?,
         dual_range: flag("dual_range")?,
-        features: features(object.get("features"))?,
-        secs_to_first_spoke: number("secs_to_first_spoke")?,
+        transmit_hours: count("transmit_hours")?,
+        secs_to_first_spoke: count("secs_to_first_spoke")?,
         control: text("control")?,
         body: String::from_utf8_lossy(body).into_owned(),
     })
-}
-
-/// The build features as a sorted, comma separated list, so two builds with
-/// the same brands compiled in group together however they were serialized.
-fn features(value: Option<&Value>) -> Result<Option<String>, Invalid> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match value {
-        Value::Null => Ok(None),
-        Value::Array(items) if items.len() <= MAX_FEATURES => {
-            let mut names = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_str() {
-                    Some(s) if !s.is_empty() && s.len() <= MAX_FIELD => names.push(s.to_string()),
-                    _ => return Err(Invalid::BadField("features")),
-                }
-            }
-            names.sort_unstable();
-            Ok(Some(names.join(",")))
-        }
-        _ => Err(Invalid::BadField("features")),
-    }
 }
 
 #[cfg(test)]
@@ -144,13 +128,14 @@ mod tests {
             "version": "3.10.0",
             "os": "linux",
             "arch": "aarch64",
-            "host": "standalone",
+            "deployment": "standalone",
             "event": "spokes",
             "brand": "Navico",
             "model": "HALO",
+            "build": "official",
             "radars": 2,
             "dual_range": true,
-            "features": ["navico", "furuno", "garmin", "koden", "raymarine"],
+            "transmit_hours": 1234,
             "secs_to_first_spoke": 12
         })
         .to_string()
@@ -163,23 +148,29 @@ mod tests {
         assert_eq!(event.install, "11111111-2222-3333-4444-555555555555");
         assert_eq!(event.event, "spokes");
         assert_eq!(event.version.as_deref(), Some("3.10.0"));
+        assert_eq!(event.deployment.as_deref(), Some("standalone"));
         assert_eq!(event.brand.as_deref(), Some("Navico"));
         assert_eq!(event.model.as_deref(), Some("HALO"));
+        assert_eq!(event.build.as_deref(), Some("official"));
         assert_eq!(event.radars, Some(2));
         assert_eq!(event.dual_range, Some(true));
+        assert_eq!(event.transmit_hours, Some(1234));
         assert_eq!(event.secs_to_first_spoke, Some(12));
         assert_eq!(event.control, None);
         assert_eq!(event.body, report());
     }
 
+    /// A report from a mayara older than the fields this collector knows
+    /// about is still a report; the fields it does not carry are simply
+    /// absent.
     #[test]
-    fn features_are_sorted_so_equal_builds_group_together() {
-        let one = parse(br#"{"install":"i","event":"e","features":["navico","furuno"]}"#).unwrap();
-        let other =
-            parse(br#"{"install":"i","event":"e","features":["furuno","navico"]}"#).unwrap();
+    fn a_report_that_omits_the_optional_fields_is_still_accepted() {
+        let event = parse(br#"{"install":"i","event":"spokes","brand":"Navico"}"#).unwrap();
 
-        assert_eq!(one.features.as_deref(), Some("furuno,navico"));
-        assert_eq!(one.features, other.features);
+        assert_eq!(event.brand.as_deref(), Some("Navico"));
+        assert_eq!(event.build, None);
+        assert_eq!(event.transmit_hours, None);
+        assert_eq!(event.deployment, None);
     }
 
     #[test]
@@ -213,9 +204,35 @@ mod tests {
             Err(Invalid::BadField("version"))
         );
         assert_eq!(
-            parse(br#"{"install":"i","event":"e","features":[1]}"#),
-            Err(Invalid::BadField("features"))
+            parse(br#"{"install":"i","event":"e","transmit_hours":"lots"}"#),
+            Err(Invalid::BadField("transmit_hours"))
         );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","build":["official"]}"#),
+            Err(Invalid::BadField("build"))
+        );
+    }
+
+    /// Every number in a report counts something, so a negative one is not a
+    /// small reading -- it is a broken one, and must not be bucketed as if it
+    /// were a radar that has barely transmitted.
+    #[test]
+    fn a_negative_count_is_refused() {
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","transmit_hours":-1}"#),
+            Err(Invalid::BadField("transmit_hours"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","radars":-1}"#),
+            Err(Invalid::BadField("radars"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","secs_to_first_spoke":-1}"#),
+            Err(Invalid::BadField("secs_to_first_spoke"))
+        );
+
+        let event = parse(br#"{"install":"i","event":"e","transmit_hours":0}"#).unwrap();
+        assert_eq!(event.transmit_hours, Some(0));
     }
 
     #[test]
