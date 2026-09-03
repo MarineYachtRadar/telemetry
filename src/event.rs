@@ -75,10 +75,18 @@ pub(crate) fn parse(body: &[u8]) -> Result<Event, Invalid> {
     let required = |field: &'static str| -> Result<String, Invalid> {
         text(field)?.ok_or(Invalid::Missing(field))
     };
-    let number = |field: &'static str| -> Result<Option<i64>, Invalid> {
+    // Every number a report carries counts something -- radars, hours,
+    // seconds -- so none of them can be negative. A negative one is a report
+    // that went wrong somewhere, not a radar that transmitted backwards, and
+    // it would otherwise settle into the lowest bucket of a breakdown as if
+    // it meant something.
+    let count = |field: &'static str| -> Result<Option<i64>, Invalid> {
         match object.get(field) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::Number(n)) => n.as_i64().map(Some).ok_or(Invalid::BadField(field)),
+            Some(Value::Number(n)) => match n.as_i64() {
+                Some(n) if n >= 0 => Ok(Some(n)),
+                _ => Err(Invalid::BadField(field)),
+            },
             Some(_) => Err(Invalid::BadField(field)),
         }
     };
@@ -100,10 +108,10 @@ pub(crate) fn parse(body: &[u8]) -> Result<Event, Invalid> {
         brand: text("brand")?,
         model: text("model")?,
         build: text("build")?,
-        radars: number("radars")?,
+        radars: count("radars")?,
         dual_range: flag("dual_range")?,
-        transmit_hours: number("transmit_hours")?,
-        secs_to_first_spoke: number("secs_to_first_spoke")?,
+        transmit_hours: count("transmit_hours")?,
+        secs_to_first_spoke: count("secs_to_first_spoke")?,
         control: text("control")?,
         body: String::from_utf8_lossy(body).into_owned(),
     })
@@ -203,6 +211,28 @@ mod tests {
             parse(br#"{"install":"i","event":"e","build":["official"]}"#),
             Err(Invalid::BadField("build"))
         );
+    }
+
+    /// Every number in a report counts something, so a negative one is not a
+    /// small reading -- it is a broken one, and must not be bucketed as if it
+    /// were a radar that has barely transmitted.
+    #[test]
+    fn a_negative_count_is_refused() {
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","transmit_hours":-1}"#),
+            Err(Invalid::BadField("transmit_hours"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","radars":-1}"#),
+            Err(Invalid::BadField("radars"))
+        );
+        assert_eq!(
+            parse(br#"{"install":"i","event":"e","secs_to_first_spoke":-1}"#),
+            Err(Invalid::BadField("secs_to_first_spoke"))
+        );
+
+        let event = parse(br#"{"install":"i","event":"e","transmit_hours":0}"#).unwrap();
+        assert_eq!(event.transmit_hours, Some(0));
     }
 
     #[test]

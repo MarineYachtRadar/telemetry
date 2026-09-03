@@ -34,24 +34,55 @@ CREATE INDEX IF NOT EXISTS event_install ON event (install, received_at);
 /// Columns every report has, whatever mayara sends.
 const FIXED_COLUMNS: [&str; 5] = ["id", "received_at", "install", "event", "body"];
 
+/// How a report field is stored, and what it may be filled from when an older
+/// database is brought forward.
+#[derive(Clone, Copy)]
+enum Kind {
+    Text,
+    Integer,
+}
+
+impl Kind {
+    fn sql(self) -> &'static str {
+        match self {
+            Kind::Text => "TEXT",
+            Kind::Integer => "INTEGER",
+        }
+    }
+
+    /// The `json_type` values a stored body may be believed for. A body kept
+    /// from before the collector knew the field was never checked against the
+    /// field's type, so anything of another shape is left out rather than
+    /// settled into a column that is queried as a number: SQLite would keep a
+    /// string in an INTEGER column as a string, and every comparison against
+    /// it would quietly answer false.
+    fn json_types(self) -> &'static str {
+        match self {
+            Kind::Text => "('text')",
+            // A boolean arrives as the 0 or 1 `json_extract` yields for it.
+            Kind::Integer => "('integer', 'true', 'false')",
+        }
+    }
+}
+
 /// The optional fields of a report, each in a column named after the field it
 /// holds. This is the one place a field is named: a column listed here is
 /// created on the next start and filled from the bodies already stored, and a
 /// column no longer listed is dropped. Every report is kept verbatim in
 /// `body`, so nothing is lost either way.
-const REPORT_COLUMNS: [(&str, &str); 12] = [
-    ("version", "TEXT"),
-    ("os", "TEXT"),
-    ("arch", "TEXT"),
-    ("deployment", "TEXT"),
-    ("brand", "TEXT"),
-    ("model", "TEXT"),
-    ("build", "TEXT"),
-    ("control", "TEXT"),
-    ("radars", "INTEGER"),
-    ("dual_range", "INTEGER"),
-    ("transmit_hours", "INTEGER"),
-    ("secs_to_first_spoke", "INTEGER"),
+const REPORT_COLUMNS: [(&str, Kind); 12] = [
+    ("version", Kind::Text),
+    ("os", Kind::Text),
+    ("arch", Kind::Text),
+    ("deployment", Kind::Text),
+    ("brand", Kind::Text),
+    ("model", Kind::Text),
+    ("build", Kind::Text),
+    ("control", Kind::Text),
+    ("radars", Kind::Integer),
+    ("dual_range", Kind::Integer),
+    ("transmit_hours", Kind::Integer),
+    ("secs_to_first_spoke", Kind::Integer),
 ];
 
 #[derive(Clone)]
@@ -133,9 +164,11 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         if present.iter().any(|name| name == column) {
             continue;
         }
+        let (sql, json_types) = (kind.sql(), kind.json_types());
         connection.execute_batch(&format!(
-            "ALTER TABLE event ADD COLUMN {column} {kind};
-             UPDATE event SET {column} = json_extract(body, '$.{column}');"
+            "ALTER TABLE event ADD COLUMN {column} {sql};
+             UPDATE event SET {column} = json_extract(body, '$.{column}')
+                 WHERE json_type(body, '$.{column}') IN {json_types};"
         ))?;
     }
 
@@ -349,6 +382,55 @@ mod tests {
             assert_eq!(deployment, "container");
             assert_eq!(build, "official");
             assert_eq!(hours, 1234);
+        });
+    }
+
+    /// A field the collector did not know about when the report arrived was
+    /// never checked against the type the field is stored in, so a body can
+    /// carry nonsense for it. Bringing the database forward must leave that
+    /// out: SQLite keeps a string in an INTEGER column as a string, and every
+    /// comparison the statistics make against it quietly answers false.
+    #[test]
+    fn a_stored_field_of_the_wrong_type_is_not_backfilled() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event (
+                     id          INTEGER PRIMARY KEY,
+                     received_at INTEGER NOT NULL,
+                     install     TEXT    NOT NULL,
+                     event       TEXT    NOT NULL,
+                     body        TEXT    NOT NULL
+                 );",
+            )
+            .unwrap();
+        for body in [
+            r#"{"install":"a","event":"spokes","transmit_hours":"lots","build":7}"#,
+            r#"{"install":"b","event":"spokes","transmit_hours":1234,"build":"official"}"#,
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO event (received_at, install, event, body)
+                     VALUES (1, 'x', 'spokes', ?1)",
+                    params![body],
+                )
+                .unwrap();
+        }
+
+        let db = Db::prepare(connection).unwrap();
+
+        db.with(|connection| {
+            let mut statement = connection
+                .prepare("SELECT transmit_hours, build FROM event ORDER BY id")
+                .unwrap();
+            let rows: Vec<(Option<i64>, Option<String>)> = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+
+            assert_eq!(rows[0], (None, None));
+            assert_eq!(rows[1], (Some(1234), Some("official".to_string())));
         });
     }
 
