@@ -79,22 +79,30 @@ The collector runs as a container on keversoft.com's existing `docker_apps` netw
 `webserver` (nginx) container that terminates TLS. Nothing is published on the host: nginx reaches
 the collector by container name at `http://telemetry:8099` and mounts it under `/mayara/`.
 
+Where the checkout and the database live on that host is the deployer's business rather than the
+collector's, so neither path is recorded here. They live in `Makefile.local`, which is gitignored;
+`make deploy` reads them from there. Deploying by hand is the same three steps:
+
 ```console
-# git clone … /docker/telemetry && cd /docker/telemetry
-# install -d -o 1000 -g 1000 /docker-volumes/telemetry
-# docker compose -f docker/docker-compose.yml up -d --build
+# git clone … <checkout> && cd <checkout>
+# install -d -o 1000 -g 1000 <data directory>
+# TELEMETRY_DATA=<data directory> docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-The database is the only state, at `/docker-volumes/telemetry/telemetry.db`. Back that up and
-nothing else. It is written by uid 1000 inside the container, which is why the host directory has to
-be owned by 1000 — a bind mount is not chowned for you.
+The database is the only state, at `telemetry.db` in that data directory. Back that up and nothing
+else. It is written by uid 1000 inside the container, which is why the host directory has to be
+owned by 1000 — a bind mount is not chowned for you. Take the copy with `sqlite3 … ".backup …"`
+rather than `cp`: the database runs in WAL mode, where the file alone is not the whole story.
+
+Upgrading is a rebuild and a restart. The schema brings itself forward on start, and because every
+report is stored verbatim, a column can always be rebuilt from the reports already collected.
 
 Then the certificate and the site:
 
 ```console
 # certbot certonly --webroot -d telemetry.keversoft.com
-# cp deploy/telemetry.keversoft.com.conf /docker/nginx/sites-available/
-# ln -s ../sites-available/telemetry.keversoft.com.conf /docker/nginx/sites-enabled/
+# cp deploy/telemetry.keversoft.com.conf <nginx sites-available>/
+# ln -s ../sites-available/telemetry.keversoft.com.conf <nginx sites-enabled>/
 # docker exec webserver nginx -t && docker exec webserver nginx -s reload
 ```
 
@@ -109,9 +117,9 @@ recreated. And `X-Forwarded-For` carries the peer nginx saw as its last entry, w
 the collector believes and rate limits on; a collector reachable without going through nginx would
 take a sender's word for its own address.
 
-To keep everything in the fleet's `/docker/docker-compose.yml` instead, paste the `telemetry:`
-service block there with `apps` as its network and `context: /docker/telemetry` as its build.
-Watchtower does not need to know about it: the image is built here, not pulled.
+To keep everything in a fleet-wide compose file instead, paste the `telemetry:` service block there
+with `apps` as its network and the checkout as its build context. Watchtower does not need to know
+about it: the image is built here, not pulled.
 
 Mayara only reports once it has a collector to report to: `DEFAULT_ENDPOINT` in
 `src/lib/telemetry.rs` has to be set to `https://telemetry.keversoft.com/mayara/v1/event` before
@@ -127,5 +135,6 @@ any release starts sending.
 | `src/ratelimit.rs` | The per-address budget, in memory only |
 | `src/web.rs` | Routes and handlers |
 | `static/index.html` | The page, embedded into the binary at build time |
+| `Makefile` | Build, test and lint; `-include`s the gitignored `Makefile.local` |
 | `docker/` | Image and compose file |
 | `deploy/telemetry.keversoft.com.conf` | nginx site for the webserver container |

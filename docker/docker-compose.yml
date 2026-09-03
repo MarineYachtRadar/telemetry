@@ -1,19 +1,21 @@
 # Collector for telemetry.keversoft.com.
 #
-# Deployed from a clone at /docker/telemetry:
+# Deployed from a clone on the host:
 #
-#   docker compose -f docker/docker-compose.yml up -d --build
+#   TELEMETRY_DATA=<host directory> \
+#     docker compose -f docker/docker-compose.yml up -d --build
 #
 # It joins the existing `docker_apps` network, so the webserver container
 # reaches it by name at http://telemetry:8099 and nothing is published on the
-# host. The service block below can equally be pasted into the fleet's
-# /docker/docker-compose.yml, with `apps` for the network and
-# `context: /docker/telemetry` for the build.
+# host. The service block below can equally be pasted into a fleet-wide
+# compose file, with `apps` for the network and the checkout for the build
+# context.
 
 # Without this, compose names the project after the directory holding this
-# file -- "docker" -- which is the fleet's own project name in /docker. Sharing
-# it would make every fleet container an orphan of this project, and a
-# `down --remove-orphans` here would take the whole server with it.
+# file -- "docker" -- which is also what a fleet-wide compose project in a
+# directory of that name is called. Sharing the name would make every fleet
+# container an orphan of this project, and a `down --remove-orphans` here
+# would take the whole server with it.
 name: telemetry
 
 services:
@@ -28,10 +30,11 @@ services:
     networks:
       - apps
     volumes:
-      # The database is the only state. It is owned by uid 1000 in the
-      # container, so the host directory has to be too:
-      #   install -d -o 1000 -g 1000 /docker-volumes/telemetry
-      - /docker-volumes/telemetry:/var/lib/telemetry
+      # The database is the only state, and it lives on the host: which
+      # directory is the deployer's business, not the collector's. It is
+      # owned by uid 1000 in the container, so the host directory has to be
+      # too: `install -d -o 1000 -g 1000 "$TELEMETRY_DATA"`.
+      - ${TELEMETRY_DATA:?set TELEMETRY_DATA to the host directory holding telemetry.db}:/var/lib/telemetry
     tmpfs:
       - /tmp
     read_only: true
@@ -42,7 +45,7 @@ services:
 
 networks:
   apps:
-    # The network the webserver container is on, created by the compose
-    # project in /docker.
+    # The network the webserver container is on, created by the fleet's own
+    # compose project.
     name: docker_apps
     external: true
