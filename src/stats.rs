@@ -19,9 +19,11 @@ const MAX_BUCKETS: i64 = 100;
 
 /// Where the transmit time buckets divide, in hours. A lifetime counter runs
 /// from a radar switched on once to a magnetron near the end of its life, so
-/// the buckets widen as they go; the last one is everything above the last
-/// bound.
-const TRANSMIT_BOUNDS: [i64; 6] = [10, 50, 100, 500, 1000, 5000];
+/// the buckets widen as they go until they settle at a thousand hours apiece;
+/// the last one is everything above the last bound.
+const TRANSMIT_BOUNDS: [i64; 14] = [
+    10, 50, 100, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+];
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Stats {
@@ -316,7 +318,11 @@ mod tests {
             .collect();
         assert_eq!(
             bands,
-            vec![("0\u{2013}10 h", 1), ("50\u{2013}100 h", 2), ("5000+ h", 1)]
+            vec![
+                ("0\u{2013}10 h", 1),
+                ("50\u{2013}100 h", 2),
+                ("9000\u{2013}10000 h", 1)
+            ]
         );
     }
 
